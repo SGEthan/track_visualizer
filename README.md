@@ -4,6 +4,8 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue) ![Streamlit](https://img.shields.io/badge/Streamlit-1.32+-red)
 
+> 100% vibe coded with [Claude Code](https://claude.ai/claude-code)
+
 ## 功能
 
 - **散点模式** — 全量 GPS 点，按速度 / 精度 / 时段 / 活动类型着色，JS 端实时视口过滤（最多显示 15 万点）
