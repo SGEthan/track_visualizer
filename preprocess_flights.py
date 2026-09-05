@@ -16,20 +16,23 @@
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import math
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import requests
 import airportsdata
 
+import config
+
 # ── 配置 ────────────────────────────────────────────────────────────────────
-FLIGHT_CSV   = "FlightyExport-2026-02-23.csv"
-OUTPUT_PATH  = "data/flight_tracks.json"
 OPENSKY_USER = os.environ.get("OPENSKY_USER", "")
 OPENSKY_PASS = os.environ.get("OPENSKY_PASS", "")
 
@@ -149,36 +152,69 @@ def query_opensky_track(callsign: str, dep_ts: int) -> list[list[float]] | None:
 
 
 # ── 时间解析 ─────────────────────────────────────────────────────────────────
-def _parse_ts(s: str) -> int | None:
+def _parse_ts(s: str, timezone_name: str = "UTC") -> int | None:
     if not s or not s.strip():
         return None
     s = s.strip()
-    # 去掉秒级小数（如 2022-08-19T17:23:12）
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            try:
+                local_timezone = ZoneInfo(timezone_name)
+            except ZoneInfoNotFoundError:
+                local_timezone = timezone.utc
+            dt = dt.replace(tzinfo=local_timezone)
         return int(dt.timestamp())
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
-def _best_ts(row: dict, *keys: str) -> int | None:
-    for k in keys:
-        v = _parse_ts(row.get(k, ""))
-        if v is not None:
-            return v
-    return None
+def _best_ts(
+    row: dict,
+    timezone_name: str,
+    *keys: str,
+) -> tuple[int | None, str | None]:
+    for key in keys:
+        value = _parse_ts(row.get(key, ""), timezone_name)
+        if value is not None:
+            return value, key
+    return None, None
 
 
 # ── 主流程 ───────────────────────────────────────────────────────────────────
-def main() -> None:
-    os.makedirs("data", exist_ok=True)
+def _default_flight_csv() -> Path | None:
+    """自动选择项目目录下最新修改的 Flighty 导出文件。"""
+    candidates = list(config.PROJECT_ROOT.glob("FlightyExport-*.csv"))
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns) if candidates else None
 
-    with open(FLIGHT_CSV, encoding="utf-8") as f:
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="将 Flighty CSV 转换为地图航线数据")
+    parser.add_argument("input", nargs="?", type=Path, help="Flighty 导出的 CSV")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=config.FLIGHTS_PATH,
+        help="输出 JSON 路径",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = args.input.expanduser().resolve() if args.input else _default_flight_csv()
+    if input_path is None or not input_path.exists():
+        raise SystemExit(
+            "[ERROR] 找不到 FlightyExport-*.csv。请传入文件路径："
+            "python preprocess_flights.py /path/to/FlightyExport.csv"
+        )
+    output_path = args.output.expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(input_path, encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
 
-    print(f"共 {len(rows)} 条航班记录")
+    print(f"读取 {input_path.name}：{len(rows)} 条航班记录")
     if OPENSKY_USER:
         print(f"OpenSky 已启用（用户: {OPENSKY_USER}），将尝试查询近 30 天航班的真实轨迹")
     else:
@@ -198,13 +234,17 @@ def main() -> None:
             print(f"  [{i+1:3d}] 跳过 {frm}→{to}：机场坐标未知")
             continue
 
-        dep_ts = _best_ts(
+        dep_timezone = AIRPORTS.get(frm, {}).get("tz", "UTC")
+        arr_timezone = AIRPORTS.get(to, {}).get("tz", "UTC")
+        dep_ts, dep_time_source = _best_ts(
             row,
+            dep_timezone,
             "Take off (Actual)", "Take off (Scheduled)",
             "Gate Departure (Actual)", "Gate Departure (Scheduled)",
         )
-        arr_ts = _best_ts(
+        arr_ts, arr_time_source = _best_ts(
             row,
+            arr_timezone,
             "Landing (Actual)", "Landing (Scheduled)",
             "Gate Arrival (Actual)", "Gate Arrival (Scheduled)",
         )
@@ -223,7 +263,7 @@ def main() -> None:
             if actual_path:
                 print(f"    ✓ 真实轨迹 {len(actual_path)} 点")
             else:
-                print(f"    ✗ 未找到，使用大圆弧")
+                print("    ✗ 未找到，使用大圆弧")
             time.sleep(0.6)  # 避免超速
 
         path = actual_path or great_circle_path(
@@ -245,6 +285,8 @@ def main() -> None:
             "to_name":       to_ap.get("name", to),
             "from_city":     frm_ap.get("city", frm),
             "to_city":       to_ap.get("city", to),
+            "from_country":  frm_ap.get("country", ""),
+            "to_country":    to_ap.get("country", ""),
             "from_coords":   list(from_c),
             "to_coords":     list(to_c),
             "aircraft":      row.get("Aircraft Type Name", "").strip(),
@@ -253,6 +295,8 @@ def main() -> None:
             "cabin":         row.get("Cabin Class", "").strip(),
             "dep_ts":        dep_ts,
             "arr_ts":        arr_ts,
+            "dep_time_source": dep_time_source,
+            "arr_time_source": arr_time_source,
             "distance_km":   round(dist_km),
             "canceled":      canceled,
             "is_actual_track": bool(actual_path),
@@ -262,12 +306,12 @@ def main() -> None:
         status = "✓ 真实" if actual_path else "○ 大圆"
         print(f"  [{i+1:3d}] {status}  {frm}→{to}  {dist_km:.0f} km  {row.get('Date','')}")
 
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False)
 
     total_km    = sum(r["distance_km"] for r in results)
     actual_cnt  = sum(1 for r in results if r["is_actual_track"])
-    print(f"\n完成！{len(results)} 条航班 → {OUTPUT_PATH}")
+    print(f"\n完成！{len(results)} 条航班 → {output_path}")
     print(f"总飞行距离：{total_km:,} km")
     if OPENSKY_USER:
         print(f"真实轨迹：{actual_cnt}/{len(results)}")

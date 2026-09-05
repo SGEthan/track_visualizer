@@ -246,8 +246,9 @@ def _flight_color(f: dict) -> list[int]:
         return _CANCEL_COLOR
     from_iata = f.get("from_iata", "")
     to_iata   = f.get("to_iata",   "")
-    from_country = _AIRPORT_COUNTRY.get(from_iata)
-    to_country   = _AIRPORT_COUNTRY.get(to_iata)
+    # 新预处理数据直接携带国家代码；兼容旧 JSON 时回退到内置表。
+    from_country = f.get("from_country") or _AIRPORT_COUNTRY.get(from_iata)
+    to_country   = f.get("to_country") or _AIRPORT_COUNTRY.get(to_iata)
     # 两端国家代码不同 → 国际航班（金色）；相同或未知 → 国内/同区域（蓝色）
     if from_country and to_country and from_country != to_country:
         return _INTL_COLOR

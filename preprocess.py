@@ -1,185 +1,192 @@
 #!/usr/bin/env python3
-"""
-一次性预处理脚本：CSV → Parquet + JSON stats
-运行方式：python preprocess.py
-耗时约 10-30 秒（取决于硬件）
-"""
-import os
-import sys
+"""将原始位置 CSV 清洗为 Track Lens 使用的 Parquet 数据。"""
+from __future__ import annotations
+
+import argparse
 import json
 import time
-from collections import defaultdict
-from datetime import datetime, timezone
+from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 import config
 
-CSV_PATH     = "all_data.csv"
-DATA_DIR     = "data"
-PARQUET_PATH = os.path.join(DATA_DIR, "tracks.parquet")
-STATS_PATH   = os.path.join(DATA_DIR, "daily_stats.json")
 
-TRIP_GAP = config.TRIP_GAP_SECONDS  # 从 config.py 统一读取
+DEFAULT_INPUT = config.PROJECT_ROOT / "all_data.csv"
+
+ALIASES = {
+    "timestamp": "ts",
+    "dataTime": "ts",
+    "longitude": "lon",
+    "latitude": "lat",
+    "isBackForeground": "bg",
+}
+REQUIRED_INPUT = {"ts", "lon", "lat", "accuracy", "stepType"}
+DEFAULT_COLUMNS = {
+    "locType": 0,
+    "heading": 0.0,
+    "distance": 0.0,
+    "bg": 0,
+    "altitude": 0.0,
+    "source": "gps",
+}
 
 
-def assign_trip_ids(df: pd.DataFrame) -> pd.Series:
-    """按时间戳排序后，以 >30 分钟间隔划分行程 ID。"""
-    df_sorted = df.sort_values("ts")
-    gaps = df_sorted["ts"].diff().fillna(0)
-    new_trip = gaps > TRIP_GAP
-    trip_id = new_trip.cumsum().astype("int32")
-    # 恢复原始索引顺序
-    return trip_id.reindex(df.index)
+def _haversine_segments_m(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """返回每个点到前一个点的距离，首项固定为 0。"""
+    if len(lon) == 0:
+        return np.array([], dtype=float)
+    lon_rad = np.radians(lon.astype(float))
+    lat_rad = np.radians(lat.astype(float))
+    dlon = np.diff(lon_rad, prepend=lon_rad[0])
+    dlat = np.diff(lat_rad, prepend=lat_rad[0])
+    lat_prev = np.roll(lat_rad, 1)
+    lat_prev[0] = lat_rad[0]
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat_prev) * np.cos(lat_rad) * np.sin(dlon / 2) ** 2
+    return 6_371_000 * 2 * np.arctan2(np.sqrt(a), np.sqrt(np.maximum(1 - a, 0)))
 
 
-def main():
-    t0 = time.time()
-
-    if not os.path.exists(CSV_PATH):
-        print(f"[ERROR] 找不到文件: {CSV_PATH}")
-        sys.exit(1)
-
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    # ── 1. 读取 CSV ───────────────────────────────────────────────────────
-    print(f"[1/4] 读取 {CSV_PATH} ...")
-    df = pd.read_csv(
-        CSV_PATH,
-        dtype={
-            "dataTime":         "int64",
-            "locType":          "int8",
-            "longitude":        "float64",
-            "latitude":         "float64",
-            "heading":          "float32",
-            "accuracy":         "float32",
-            "speed":            "float32",
-            "distance":         "float32",
-            "isBackForeground": "int8",
-            "stepType":         "int8",
-            "altitude":         "float32",
-            "source":           "str",    # all_data.csv 特有列，原始CSV无此列
-        },
-        low_memory=False,
-    )
-    print(f"    共 {len(df):,} 行，用时 {time.time()-t0:.1f}s")
-
-    # ── 2. 清理 & 重命名 ─────────────────────────────────────────────────
-    print("[2/4] 数据清理 ...")
-    df = df.rename(columns={
-        "dataTime":         "ts",
-        "longitude":        "lon",
-        "latitude":         "lat",
-        "isBackForeground": "bg",
-    })
-
-    # 过滤掉明显无效坐标
-    df = df[(df["lon"].between(-180, 180)) & (df["lat"].between(-90, 90))]
-    # accuracy=0 对 GPS 点是无效记录，但照片补充点本身就是 accuracy=0，予以保留
-    is_photo = df.get("source", pd.Series("gps", index=df.index)) == "photo"
-    df = df[is_photo | (df["accuracy"] > 0)]
-    df = df.drop_duplicates(subset=["ts", "lon", "lat"])
-
-    # ── 3. 分配行程 ID（时间间隔 + 距离跳跃双重检测）────────────────────
-    print("[3/4] 分配行程 ID ...")
-    df = df.sort_values("ts").reset_index(drop=True)
-
-    # 先用 Haversine 计算相邻点距离，用于检测 GPS 坐标跳跃
-    _lon1 = np.radians(df["lon"].shift(1).values)
-    _lat1 = np.radians(df["lat"].shift(1).values)
-    _lon2 = np.radians(df["lon"].values)
-    _lat2 = np.radians(df["lat"].values)
-    _dlat = _lat2 - _lat1; _dlon = _lon2 - _lon1
-    _a = np.sin(_dlat/2)**2 + np.cos(_lat1)*np.cos(_lat2)*np.sin(_dlon/2)**2
-    _dist_m_raw = 6_371_000 * 2 * np.arctan2(np.sqrt(_a), np.sqrt(1 - _a))
-    _dist_m_raw[0] = 0  # 第一行无前驱
-
-    gaps = df["ts"].diff().fillna(0)
-    MAX_JUMP_M = config.TRIP_MAX_JUMP_M   # 超过此距离视为坐标跳跃，强制新行程
-    new_trip = (gaps > TRIP_GAP) | (_dist_m_raw > MAX_JUMP_M)
-    df["trip_id"] = new_trip.cumsum().astype("int32")
-
-    n_trips = df["trip_id"].nunique()
-    print(f"    共 {n_trips:,} 条行程")
-
-    # ── 3b. 用坐标差分重新计算速度 ──────────────────────────────────────
-    print("[3b] 用坐标插值重新计算速度 ...")
-
-    # Haversine 向量化：返回相邻行之间的距离（米）
-    lon1 = np.radians(df["lon"].shift(1).values)
-    lat1 = np.radians(df["lat"].shift(1).values)
-    lon2 = np.radians(df["lon"].values)
-    lat2 = np.radians(df["lat"].values)
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    dist_m = 6_371_000 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-
-    dt_s = df["ts"].diff().values.astype("float64")           # 时间差（秒）
-    same_trip = (df["trip_id"].values == df["trip_id"].shift(1).values)  # 同行程
-
-    # 速度 = 位移 / 时间，跨行程边界或 dt=0 时置 -1（未知）
-    with np.errstate(divide="ignore", invalid="ignore"):
-        spd = np.where(same_trip & (dt_s > 0), (dist_m / dt_s) * 3.6, -1.0)
-
-    # 限制合理上限（300 km/h），超过的视为 GPS 噪声，置 -1
-    spd = np.where(spd > 300, -1.0, spd)
-
-    df["speed"] = spd.astype("float32")
-
-    # ── 3c. 距离去重：丢弃相邻位移 < MIN_POINT_DIST_M 的冗余静止点 ────
-    MIN_D = config.MIN_POINT_DIST_M
-    print(f"[3c] 距离去重（阈值 {MIN_D} m）...")
-    before = len(df)
-    # 行程内位移 < 阈值的点视为冗余；行程边界第一个点始终保留（same_trip=False）
-    keep_mask = (~same_trip) | (dist_m >= MIN_D)
-    df = df[keep_mask].reset_index(drop=True)
-    removed = before - len(df)
-    print(f"    去重后：{len(df):,} 行（减少 {removed:,}，{100*removed/before:.1f}%）")
-
-    # ── 4. 计算每日统计 ──────────────────────────────────────────────────
-    print("[4/4] 计算每日统计并写入磁盘 ...")
-    df["date"] = pd.to_datetime(df["ts"], unit="s").dt.strftime("%Y-%m-%d")
-
-    daily = (
-        df.groupby("date")
-        .agg(
-            count=("ts", "count"),
-            min_ts=("ts", "min"),
-            max_ts=("ts", "max"),
+def prepare_tracks(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """纯数据转换函数，便于测试和在其他脚本中复用。"""
+    df = raw.rename(columns={key: value for key, value in ALIASES.items() if key in raw.columns}).copy()
+    missing = sorted(REQUIRED_INPUT.difference(df.columns))
+    if missing:
+        raise ValueError(
+            "输入 CSV 缺少必要列：" + ", ".join(missing)
+            + "。时间列可使用 dataTime、timestamp 或 ts。"
         )
-        .reset_index()
+
+    for column, default in DEFAULT_COLUMNS.items():
+        if column not in df.columns:
+            df[column] = default
+
+    numeric = ["ts", "lon", "lat", "accuracy", "stepType", "bg", "altitude"]
+    for column in numeric:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = df.dropna(subset=["ts", "lon", "lat", "accuracy", "stepType"])
+    df = df[
+        df["lon"].between(-180, 180)
+        & df["lat"].between(-90, 90)
+        & np.isfinite(df["lon"])
+        & np.isfinite(df["lat"])
+    ]
+
+    is_photo = df["source"].fillna("gps").eq("photo")
+    df = df[is_photo | (df["accuracy"] > 0)]
+    df = (
+        df.drop_duplicates(subset=["ts", "lon", "lat"])
+        .sort_values("ts")
+        .reset_index(drop=True)
     )
-    daily_dict = daily.set_index("date").to_dict(orient="index")
-    with open(STATS_PATH, "w") as f:
-        json.dump(daily_dict, f)
-    print(f"    每日统计写入 {STATS_PATH}")
+    if df.empty:
+        raise ValueError("清理后没有有效轨迹点。")
 
-    # 删除辅助列，降低内存占用
-    df = df.drop(columns=["date"])
+    df["ts"] = df["ts"].astype("int64")
+    distances = _haversine_segments_m(df["lon"].to_numpy(), df["lat"].to_numpy())
+    gaps = df["ts"].diff().fillna(0).to_numpy()
+    new_trip = (gaps > config.TRIP_GAP_SECONDS) | (distances > config.TRIP_MAX_JUMP_M)
+    new_trip[0] = False
+    df["trip_id"] = np.cumsum(new_trip).astype("int32")
 
-    # 压缩数据类型
-    df["ts"]       = df["ts"].astype("int32")
-    df["lon"]      = df["lon"].astype("float32")
-    df["lat"]      = df["lat"].astype("float32")
-    df["speed"]    = df["speed"].astype("float32")
+    delta_seconds = df["ts"].diff().to_numpy(dtype=float)
+    same_trip = df["trip_id"].to_numpy() == df["trip_id"].shift(1).to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        speed = np.where(
+            same_trip & (delta_seconds > 0),
+            distances / delta_seconds * 3.6,
+            -1.0,
+        )
+    speed = np.where(np.isfinite(speed) & (speed <= 300), speed, -1.0)
+    df["speed"] = speed.astype("float32")
+
+    keep = (~same_trip) | (distances >= config.MIN_POINT_DIST_M)
+    before_dedupe = len(df)
+    df = df.loc[keep].reset_index(drop=True)
+
+    # 统一稳定的数据类型。时间保留 int64，避免 2038 年溢出。
+    df["lon"] = df["lon"].astype("float32")
+    df["lat"] = df["lat"].astype("float32")
     df["accuracy"] = df["accuracy"].astype("float32")
     df["stepType"] = df["stepType"].astype("int8")
-    df["bg"]       = df["bg"].astype("int8")
-    df["altitude"] = df["altitude"].astype("float32")
+    df["bg"] = df["bg"].fillna(0).astype("int8")
+    df["altitude"] = df["altitude"].fillna(0).astype("float32")
+    df["source"] = df["source"].fillna("gps").astype("string")
 
-    # 写 Parquet
-    df.to_parquet(PARQUET_PATH, compression="zstd", index=False)
-    size_mb = os.path.getsize(PARQUET_PATH) / 1e6
-    print(f"    Parquet 写入 {PARQUET_PATH}（{size_mb:.1f} MB）")
+    local_dates = (
+        pd.to_datetime(df["ts"], unit="s", utc=True)
+        .dt.tz_convert(config.DISPLAY_TIMEZONE)
+        .dt.strftime("%Y-%m-%d")
+    )
+    daily = (
+        df.assign(_date=local_dates)
+        .groupby("_date")
+        .agg(count=("ts", "size"), min_ts=("ts", "min"), max_ts=("ts", "max"))
+    )
+    daily_stats = daily.to_dict(orient="index")
+    metadata = {
+        "input_points": int(len(raw)),
+        "output_points": int(len(df)),
+        "removed_nearby": int(before_dedupe - len(df)),
+        "trips": int(df["trip_id"].nunique()),
+        "daily_stats": daily_stats,
+    }
+    return df, metadata
 
-    elapsed = time.time() - t0
-    print(f"\n完成！共用时 {elapsed:.1f}s")
-    print(f"  行数：{len(df):,}")
-    print(f"  行程：{n_trips:,}")
-    print(f"  日期：{df['ts'].apply(lambda x: pd.Timestamp(x, unit='s').strftime('%Y-%m-%d')).min()} ~ "
-          f"{df['ts'].apply(lambda x: pd.Timestamp(x, unit='s').strftime('%Y-%m-%d')).max()}")
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "input",
+        nargs="?",
+        type=Path,
+        default=DEFAULT_INPUT,
+        help="输入 CSV，默认 all_data.csv",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=config.DATA_DIR,
+        help="输出目录，默认项目内 data/",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = args.input.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+    if not input_path.exists():
+        raise SystemExit(f"[ERROR] 找不到文件：{input_path}")
+
+    started = time.perf_counter()
+    print(f"[1/3] 读取 {input_path.name} ...")
+    raw = pd.read_csv(input_path, low_memory=False)
+    print(f"      {len(raw):,} 行")
+
+    print("[2/3] 清理、切分行程并计算速度 ...")
+    try:
+        tracks, metadata = prepare_tracks(raw)
+    except ValueError as exc:
+        raise SystemExit(f"[ERROR] {exc}") from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = output_dir / "tracks.parquet"
+    stats_path = output_dir / "daily_stats.json"
+
+    print("[3/3] 写入 Parquet 和每日统计 ...")
+    tracks.to_parquet(parquet_path, compression="zstd", index=False)
+    with open(stats_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata["daily_stats"], handle, ensure_ascii=False)
+
+    elapsed = time.perf_counter() - started
+    size_mb = parquet_path.stat().st_size / 1_000_000
+    print(
+        f"完成：{metadata['output_points']:,} 点 · {metadata['trips']:,} 行程 · "
+        f"{size_mb:.1f} MB · {elapsed:.1f}s"
+    )
+    print(f"时区：{config.TIMEZONE_NAME}")
+    print(f"输出：{parquet_path}")
 
 
 if __name__ == "__main__":
